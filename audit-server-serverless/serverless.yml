@@ -1,0 +1,121 @@
+service: serverless-rocketseat
+frameworkVersion: '2'
+
+custom:
+  auditTable: DeletedAccountAuditTable
+
+provider:
+  name: aws
+  runtime: nodejs14.x
+  stage: dev
+  region: us-east-1
+  memorySize: 128
+  tracing:
+    lambda: true
+  iamRoleStatements:
+    - Effect: Allow
+      Action:
+        - SNS:Publish
+      Resource:
+        - !Ref DeletedAccountTopic
+    - Effect: Allow
+      Action:
+        - xray:PutTraceSegments
+        - xray:PutTelemetryRecords
+      Resource:
+        - "*"
+
+    - Effect: Allow
+      Action:
+        - dynamodb:*
+      Resource:
+        - {"Fn::GetAtt": ["DeletedAccountAuditTable", "Arn"]}
+
+resources:
+  Resources:
+    DeletedAccountTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        DisplayName: 'Topic used for publishing deleted accounts'
+        TopicName: DeletedAccountTopic
+
+    DeletedAccountEventAuditQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: DeletedAccountEventAuditQueue
+        MessageRetentionPeriod: 1209600 # 14 days
+        VisibilityTimeout: 60
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt:
+              - DeletedAccountEventAuditQueueDLQ
+              - Arn
+          maxReceiveCount: 5
+
+    DeletedAccountEventAuditQueueDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: DeletedAccountEventAuditQueueDLQ
+        MessageRetentionPeriod: 1209600 # 14 days
+
+    DeletedAccountAuditQueueTopicPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - Ref: DeletedAccountEventAuditQueue
+        PolicyDocument:
+          Id: DeletedAccountEventAuditQueuePolicy
+          Statement:
+            - Effect: Allow
+              Principal: "*"
+              Resource: "*"
+              Action:
+                - sqs:SendMessage
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref DeletedAccountTopic
+
+    DeleteAccountAuditQueueTopicSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        Protocol: sqs
+        RawMessageDelivery: true
+        TopicArn: !Ref DeletedAccountTopic
+        Endpoint:
+          Fn::GetAtt:
+            - DeletedAccountEventAuditQueue
+            - Arn
+
+    DeletedAccountAuditTable:
+      Type: "AWS::DynamoDB::Table"
+      Properties:
+        BillingMode: PAY_PER_REQUEST
+        TableName: ${self:custom.auditTable}
+        AttributeDefinitions:
+          - AttributeName: "userId"
+            AttributeType: "S"
+          - AttributeName: "deletedAt"
+            AttributeType: "N"
+        KeySchema:
+          - AttributeName: "userId"
+            KeyType: "HASH"
+          - AttributeName: "deletedAt"
+            KeyType: "RANGE"
+
+functions:
+  deleteAccount:
+    handler: src/app.deleteAccount
+    environment:
+      SNS_TOPIC: !Ref DeletedAccountTopic
+  recordDeletedAccountInfo:
+    handler: src/consumer.recordDeletedAccountInfo
+    timeout: 60
+    environment:
+      DYNAMODB_TABLE: ${self:custom.auditTable}
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - DeletedAccountEventAuditQueue
+              - Arn
+          batchSize: 1
